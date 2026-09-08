@@ -1,4 +1,3 @@
-
 package com.percherry.roundadas;
 
 import android.app.Activity;
@@ -27,7 +26,7 @@ public class MainActivity extends Activity {
             String raw = intent.getStringExtra("steering_wheel");
 
             if (raw == null) {
-                rawView.setText("Broadcast received\nsteering_wheel extra is null");
+                rawView.setText("Broadcast received, but steering_wheel is null");
                 return;
             }
 
@@ -35,15 +34,22 @@ public class MainActivity extends Activity {
 
             try {
                 JSONObject json = new JSONObject(raw);
-                int angle = json.getInt("steering_wheel_angle");
 
-                if (minAngle == null || angle < minAngle)
+                int angle = Integer.parseInt(json.optString("angle", "0"));
+                int speed = Integer.parseInt(json.optString("speed", "0"));
+
+                if (minAngle == null || angle < minAngle) {
                     minAngle = angle;
+                }
 
-                if (maxAngle == null || angle > maxAngle)
+                if (maxAngle == null || angle > maxAngle) {
                     maxAngle = angle;
+                }
 
-                angleView.setText("Steering angle: " + angle);
+                angleView.setText(
+                    "Steering angle: " + angle +
+                    "\nSteering speed: " + speed
+                );
 
                 rangeView.setText(
                     "Minimum: " + minAngle +
@@ -51,7 +57,7 @@ public class MainActivity extends Activity {
                 );
 
             } catch (Exception e) {
-                angleView.setText("Received data - unable to parse angle");
+                angleView.setText("Received steering data, but could not parse it");
             }
         }
     };
@@ -74,6 +80,10 @@ public class MainActivity extends Activity {
             new IntentFilter("com.percherry.roundadas.LOOK_AROUND_360_CAN");
 
         registerReceiver(receiver, filter);
+
+        Intent sync = new Intent("com.percherry.roundadas");
+        sync.putExtra("cmd", "readyForSync");
+        sendBroadcast(sync);
     }
 
     @Override
