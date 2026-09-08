@@ -8,7 +8,7 @@ import android.content.IntentFilter;
 import android.os.Bundle;
 import android.widget.TextView;
 
-import org.json.JSONObject;
+import java.util.Set;
 
 public class MainActivity extends Activity {
 
@@ -16,49 +16,46 @@ public class MainActivity extends Activity {
     private TextView rangeView;
     private TextView rawView;
 
-    private Integer minAngle = null;
-    private Integer maxAngle = null;
-
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
 
-            String raw = intent.getStringExtra("steering_wheel");
+            StringBuilder out = new StringBuilder();
 
-            if (raw == null) {
-                rawView.setText("Broadcast received, but steering_wheel is null");
-                return;
+            out.append("ACTION:\n");
+            out.append(intent.getAction()).append("\n\n");
+
+            Bundle extras = intent.getExtras();
+
+            if (extras == null || extras.isEmpty()) {
+                out.append("No extras received.");
+            } else {
+                Set<String> keys = extras.keySet();
+
+                for (String key : keys) {
+                    Object value = extras.get(key);
+
+                    out.append("KEY: ").append(key).append("\n");
+
+                    if (value == null) {
+                        out.append("TYPE: null\n");
+                        out.append("VALUE: null\n\n");
+                    } else {
+                        out.append("TYPE: ")
+                           .append(value.getClass().getName())
+                           .append("\n");
+
+                        out.append("VALUE: ")
+                           .append(String.valueOf(value))
+                           .append("\n\n");
+                    }
+                }
             }
 
-            rawView.setText(raw);
+            rawView.setText(out.toString());
 
-            try {
-                JSONObject json = new JSONObject(raw);
-
-                int angle = Integer.parseInt(json.optString("angle", "0"));
-                int speed = Integer.parseInt(json.optString("speed", "0"));
-
-                if (minAngle == null || angle < minAngle) {
-                    minAngle = angle;
-                }
-
-                if (maxAngle == null || angle > maxAngle) {
-                    maxAngle = angle;
-                }
-
-                angleView.setText(
-                    "Steering angle: " + angle +
-                    "\nSteering speed: " + speed
-                );
-
-                rangeView.setText(
-                    "Minimum: " + minAngle +
-                    "\nMaximum: " + maxAngle
-                );
-
-            } catch (Exception e) {
-                angleView.setText("Received steering data, but could not parse it");
-            }
+            angleView.setText("Broadcast received");
+            rangeView.setText("Waiting for steering payload...");
         }
     };
 
@@ -76,10 +73,20 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
 
-        IntentFilter filter =
-            new IntentFilter("com.percherry.roundadas.LOOK_AROUND_360_CAN");
+        IntentFilter filter = new IntentFilter();
+        filter.addAction("com.percherry.roundadas");
+        filter.addAction("com.percherry.roundadas.LOOK_AROUND_360_CAN");
 
         registerReceiver(receiver, filter);
+
+        angleView.setText("Listening...");
+        rangeView.setText(
+            "Listening for:\n" +
+            "com.percherry.roundadas\n" +
+            "LOOK_AROUND_360_CAN"
+        );
+
+        rawView.setText("No broadcast received yet");
 
         Intent sync = new Intent("com.percherry.roundadas");
         sync.putExtra("cmd", "readyForSync");
