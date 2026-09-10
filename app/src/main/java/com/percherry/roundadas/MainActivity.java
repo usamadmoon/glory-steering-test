@@ -1,15 +1,19 @@
 package com.percherry.roundadas;
 
 import android.app.Activity;
-import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
+import android.content.ServiceConnection;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
+import android.os.Message;
+import android.os.Messenger;
+import android.os.RemoteException;
 import android.widget.TextView;
 
-import java.util.Set;
+import java.util.Arrays;
 
 public class MainActivity extends Activity {
 
@@ -17,55 +21,135 @@ public class MainActivity extends Activity {
     private TextView rangeView;
     private TextView rawView;
 
-    private final Handler handler = new Handler();
-    private int receivedCount = 0;
+    private Messenger mcuMessenger;
+    private boolean bound = false;
 
-    private final BroadcastReceiver receiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
+    private int packetCount = 0;
+    private int lastTrackValue = -1;
 
-            receivedCount++;
+    /*
+     * Messages returned from McuServer arrive here.
+     */
+    private final Handler incomingHandler = new Handler(msg -> {
 
-            StringBuilder out = new StringBuilder();
+        StringBuilder out = new StringBuilder();
 
-            out.append("RECEIVED #").append(receivedCount).append("\n\n");
-            out.append("ACTION:\n");
-            out.append(intent.getAction()).append("\n\n");
+        out.append("Message.what: ")
+           .append(msg.what)
+           .append("\n\n");
 
-            Bundle extras = intent.getExtras();
+        Bundle data = msg.getData();
 
-            if (extras == null || extras.isEmpty()) {
-                out.append("No extras received.");
-            } else {
+        if (data != null) {
 
-                Set<String> keys = extras.keySet();
+            int command = data.getInt("cmdcode", -1);
+            byte[] payload = data.getByteArray("data");
 
-                for (String key : keys) {
+            out.append("cmdcode: ")
+               .append(command)
+               .append("\n");
 
-                    Object value = extras.get(key);
+            if (payload != null) {
 
-                    out.append("KEY: ").append(key).append("\n");
+                packetCount++;
 
-                    if (value == null) {
-                        out.append("TYPE: null\n");
-                        out.append("VALUE: null\n\n");
-                    } else {
-                        out.append("TYPE: ")
-                           .append(value.getClass().getName())
-                           .append("\n");
+                out.append("packet count: ")
+                   .append(packetCount)
+                   .append("\n\n");
 
-                        out.append("VALUE: ")
-                           .append(String.valueOf(value))
-                           .append("\n\n");
-                    }
+                out.append("raw bytes:\n")
+                   .append(Arrays.toString(payload))
+                   .append("\n\n");
+
+                out.append("hex:\n");
+
+                for (byte b : payload) {
+                    out.append(
+                        String.format("%02X ", b & 0xFF)
+                    );
                 }
+
+                /*
+                 * CKXBackCar2 uses byte index 2
+                 * from command 235 for the track position.
+                 */
+                if (command == 235 && payload.length > 2) {
+
+                    int track = payload[2] & 0xFF;
+                    lastTrackValue = track;
+
+                    angleView.setText(
+                        "TRACK VALUE: " + track
+                    );
+
+                    String direction;
+
+                    if (track == 0) {
+                        direction = "STRAIGHT";
+                    } else if (track >= 1 && track <= 36) {
+                        direction = "RIGHT";
+                    } else if (track >= 129 && track <= 164) {
+                        direction = "LEFT";
+                    } else {
+                        direction = "UNKNOWN";
+                    }
+
+                    rangeView.setText(
+                        "MCU command: 235 / 0xEB\n" +
+                        "Direction: " + direction +
+                        "\nPackets: " + packetCount
+                    );
+                }
+
+            } else {
+                out.append("\nNo byte[] payload.");
             }
 
-            rawView.setText(out.toString());
-
-            angleView.setText("Broadcast received: " + receivedCount);
+        } else {
+            out.append("No Bundle received.");
         }
-    };
+
+        rawView.setText(out.toString());
+
+        return true;
+    });
+
+    private final Messenger clientMessenger =
+        new Messenger(incomingHandler);
+
+    private final ServiceConnection connection =
+        new ServiceConnection() {
+
+            @Override
+            public void onServiceConnected(
+                ComponentName name,
+                IBinder service
+            ) {
+
+                bound = true;
+                mcuMessenger = new Messenger(service);
+
+                angleView.setText("MCU SERVICE CONNECTED");
+                rangeView.setText(
+                    "Registering for track command 235 / 0xEB"
+                );
+
+                registerTrackCallback();
+            }
+
+            @Override
+            public void onServiceDisconnected(
+                ComponentName name
+            ) {
+
+                bound = false;
+                mcuMessenger = null;
+
+                angleView.setText(
+                    "MCU SERVICE DISCONNECTED"
+                );
+            }
+        };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -76,82 +160,100 @@ public class MainActivity extends Activity {
         angleView = findViewById(R.id.angle);
         rangeView = findViewById(R.id.range);
         rawView = findViewById(R.id.raw);
+
+        angleView.setText("Connecting to McuServer...");
+        rangeView.setText("Read-only command 0xEB listener");
+        rawView.setText("No MCU packet received yet.");
+
+        bindToMcuService();
     }
 
-    @Override
-    protected void onResume() {
+    private void bindToMcuService() {
 
-        super.onResume();
-
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(
-            "com.percherry.roundadas.LOOK_AROUND_360_CAN"
+        Intent intent = new Intent(
+            "com.carocean.mcuservice"
         );
 
-        registerReceiver(receiver, filter);
-
-        angleView.setText("Listening...");
-        rangeView.setText(
-            "Sending readyForSync directly to\n" +
-            "CarEventService"
+        intent.setPackage(
+            "com.carocean.mcuserver"
         );
 
-        rawView.setText(
-            "No response yet.\n\n" +
-            "Request #1 will be sent now.\n" +
-            "Request #2 after 1 second.\n" +
-            "Request #3 after 3 seconds."
+        boolean result = bindService(
+            intent,
+            connection,
+            Context.BIND_AUTO_CREATE
         );
 
-        sendSyncRequest();
-
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                sendSyncRequest();
-            }
-        }, 1000);
-
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                sendSyncRequest();
-            }
-        }, 3000);
+        if (!result) {
+            angleView.setText("MCU BIND FAILED");
+            rawView.setText(
+                "bindService() returned false"
+            );
+        }
     }
 
-    private void sendSyncRequest() {
+    private void registerTrackCallback() {
 
-        Intent sync = new Intent(
-            "com.percherry.roundadas"
-        );
-
-        /*
-         * Critical difference:
-         * send the request specifically to CarEventService.
-         */
-        sync.setPackage(
-            "com.autochips.careventservice"
-        );
-
-        sync.putExtra(
-            "cmd",
-            "readyForSync"
-        );
-
-        sendBroadcast(sync);
-    }
-
-    @Override
-    protected void onPause() {
-
-        super.onPause();
-
-        handler.removeCallbacksAndMessages(null);
+        if (mcuMessenger == null) {
+            return;
+        }
 
         try {
-            unregisterReceiver(receiver);
-        } catch (Exception ignored) {
+
+            /*
+             * Factory McuService protocol:
+             * what = 256 -> register callback
+             */
+            Message msg = Message.obtain(
+                null,
+                256
+            );
+
+            Bundle bundle = new Bundle();
+
+            bundle.putIntArray(
+                "cmdcode",
+                new int[]{235}
+            );
+
+            msg.setData(bundle);
+
+            /*
+             * McuServer sends responses back here.
+             */
+            msg.replyTo = clientMessenger;
+
+            mcuMessenger.send(msg);
+
+            rawView.setText(
+                "Registered for MCU command 235 / 0xEB.\n\n" +
+                "Now turn the steering wheel slowly left and right."
+            );
+
+        } catch (RemoteException e) {
+
+            angleView.setText(
+                "MCU REGISTER FAILED"
+            );
+
+            rawView.setText(
+                e.getClass().getName() +
+                "\n" +
+                e.getMessage()
+            );
         }
+    }
+
+    @Override
+    protected void onDestroy() {
+
+        if (bound) {
+            try {
+                unbindService(connection);
+            } catch (Exception ignored) {
+            }
+        }
+
+        super.onDestroy();
     }
 }
