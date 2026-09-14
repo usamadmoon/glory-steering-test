@@ -1,25 +1,49 @@
 package com.percherry.roundadas;
 
 import android.app.Activity;
-import android.content.ComponentName;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.ServiceConnection;
+import android.content.IntentFilter;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.IBinder;
-import android.os.Message;
-import android.os.Messenger;
-import android.os.RemoteException;
 import android.widget.Button;
 import android.widget.TextView;
 
-import java.util.Arrays;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Locale;
-import java.util.Map;
-import java.util.TreeMap;
+import java.util.Set;
 
 public class MainActivity extends Activity {
+
+    /*
+     * Factory APK findings:
+     *
+     * vendor.autochips.hardware.car_event_monitor.V1_0.ICarEventMonitor
+     *
+     * Known extras:
+     *   speed_current_speed
+     *   speed_accelerate_speed
+     *   steering_wheel_angle
+     *   steering_wheel_speed
+     *
+     * Firmware-configurable broadcast destination:
+     *   persist.vendor.cem.intent.action
+     *   persist.vendor.cem.intent.package
+     *
+     * Fallback action found in the factory APK:
+     *   com.percherry.roundadas.LOOK_AROUND_360_CAN
+     */
+
+    private static final String PROP_ACTION =
+            "persist.vendor.cem.intent.action";
+
+    private static final String PROP_PACKAGE =
+            "persist.vendor.cem.intent.package";
+
+    private static final String FALLBACK_ACTION =
+            "com.percherry.roundadas.LOOK_AROUND_360_CAN";
 
     private TextView steeringView;
     private TextView speedView;
@@ -27,218 +51,120 @@ public class MainActivity extends Activity {
     private TextView statusView;
     private TextView rawView;
 
-    private Button sniffButton;
-    private Button baselineButton;
+    private Button startButton;
+    private Button clearButton;
 
-    private Messenger mcuMessenger;
+    private boolean receiverRegistered = false;
 
-    private boolean bound = false;
-    private boolean fullSniffer = false;
+    private String configuredAction = "";
+    private String configuredPackage = "";
 
-    private long totalPackets = 0;
-    private long baselineNumber = 0;
+    private long eventCount = 0;
 
-    private static class ByteState {
-        int baseline = -1;
-        int min = 255;
-        int max = 0;
-        int current = -1;
-        int previous = -1;
-        long changes = 0;
-        boolean changedSinceBaseline = false;
-    }
+    private String lastSpeed = "--";
+    private String lastAcceleration = "--";
+    private String lastSteeringAngle = "--";
+    private String lastSteeringSpeed = "--";
 
-    private static class CmdState {
-        long rx = 0;
-        long packetChanges = 0;
-        byte[] last = null;
-        byte[] baselinePayload = null;
-        boolean changedSinceBaseline = false;
-        ByteState[] bytes = null;
-    }
+    private final ArrayList<String> recentEvents = new ArrayList<>();
 
-    private final Map<Integer, CmdState> states = new TreeMap<>();
+    private final BroadcastReceiver carEventReceiver =
+            new BroadcastReceiver() {
 
-    private final Handler steeringHandler = new Handler(msg -> {
-        Bundle bundle = msg.getData();
+                @Override
+                public void onReceive(
+                        Context context,
+                        Intent intent
+                ) {
 
-        if (bundle == null) {
-            return true;
-        }
-
-        int cmd = bundle.getInt("cmdcode", -1);
-        byte[] data = bundle.getByteArray("data");
-
-        if (cmd == 235 && data != null && data.length > 2) {
-            int track = data[2] & 0xFF;
-
-            steeringView.setText(
-                    "Steering 0xEB: "
-                            + track
-                            + "  "
-                            + direction(track)
-            );
-        }
-
-        return true;
-    });
-
-    private final Messenger steeringReply = new Messenger(steeringHandler);
-
-    private final Handler sniffHandler = new Handler(msg -> {
-        Bundle bundle = msg.getData();
-
-        if (bundle == null) {
-            return true;
-        }
-
-        int cmd = bundle.getInt("cmdcode", -1);
-        byte[] data = bundle.getByteArray("data");
-
-        if (cmd < 0 || data == null) {
-            return true;
-        }
-
-        totalPackets++;
-
-        CmdState state = states.get(cmd);
-
-        if (state == null) {
-            state = new CmdState();
-            states.put(cmd, state);
-        }
-
-        state.rx++;
-
-        if (state.bytes == null || state.bytes.length != data.length) {
-            state.bytes = new ByteState[data.length];
-
-            for (int i = 0; i < data.length; i++) {
-                state.bytes[i] = new ByteState();
-            }
-        }
-
-        for (int i = 0; i < data.length; i++) {
-            int value = data[i] & 0xFF;
-            ByteState bs = state.bytes[i];
-
-            if (bs.current == -1) {
-                bs.current = value;
-                bs.previous = value;
-
-                if (baselineNumber > 0) {
-                    bs.baseline = value;
-                    bs.min = value;
-                    bs.max = value;
-                }
-
-            } else {
-                bs.previous = bs.current;
-                bs.current = value;
-
-                if (bs.current != bs.previous) {
-                    bs.changes++;
-
-                    if (baselineNumber > 0) {
-                        bs.changedSinceBaseline = true;
+                    if (intent == null) {
+                        return;
                     }
+
+                    eventCount++;
+
+                    String action =
+                            intent.getAction();
+
+                    Bundle extras =
+                            intent.getExtras();
+
+                    StringBuilder log =
+                            new StringBuilder();
+
+                    log.append("#")
+                            .append(eventCount)
+                            .append(" ACTION=")
+                            .append(action == null ? "<null>" : action)
+                            .append("\n");
+
+                    if (extras == null
+                            || extras.isEmpty()) {
+
+                        log.append("No extras");
+
+                        addEvent(
+                                log.toString()
+                        );
+
+                        updateHeader();
+
+                        return;
+                    }
+
+                    ArrayList<String> keys =
+                            new ArrayList<>(
+                                    extras.keySet()
+                            );
+
+                    Collections.sort(keys);
+
+                    for (String key : keys) {
+
+                        Object value;
+
+                        try {
+
+                            value =
+                                    extras.get(key);
+
+                        } catch (Throwable t) {
+
+                            value =
+                                    "<error:"
+                                            + t.getClass()
+                                            .getSimpleName()
+                                            + ">";
+                        }
+
+                        log.append(key)
+                                .append("=")
+                                .append(String.valueOf(value))
+                                .append("\n");
+
+                        processKnownField(
+                                key,
+                                value
+                        );
+                    }
+
+                    addEvent(
+                            log.toString()
+                    );
+
+                    updateHeader();
                 }
-            }
+            };
 
-            if (baselineNumber > 0) {
-                if (value < bs.min) {
-                    bs.min = value;
-                }
-
-                if (value > bs.max) {
-                    bs.max = value;
-                }
-            }
-        }
-
-        boolean packetChanged =
-                state.last == null
-                        || !Arrays.equals(state.last, data);
-
-        if (packetChanged) {
-            state.packetChanges++;
-
-            if (baselineNumber > 0) {
-                if (state.baselinePayload == null
-                        || !Arrays.equals(state.baselinePayload, data)) {
-                    state.changedSinceBaseline = true;
-                }
-            }
-
-            state.last = Arrays.copyOf(data, data.length);
-
-            renderTable();
-        }
-
-        if (cmd == 235 && data.length > 2) {
-            int track = data[2] & 0xFF;
-
-            steeringView.setText(
-                    "Steering 0xEB: "
-                            + track
-                            + "  "
-                            + direction(track)
-            );
-        }
-
-        updateStatus();
-
-        return true;
-    });
-
-    private final Messenger sniffReply = new Messenger(sniffHandler);
-
-    private final ServiceConnection connection = new ServiceConnection() {
-
-        @Override
-        public void onServiceConnected(
-                ComponentName name,
-                IBinder service
-        ) {
-
-            bound = true;
-
-            mcuMessenger = new Messenger(service);
-
-            steeringView.setText(
-                    "MCU connected - 0xEB steering not seen yet"
-            );
-
-            register(
-                    new int[]{235},
-                    steeringReply
-            );
-
-            updateStatus();
-        }
-
-        @Override
-        public void onServiceDisconnected(
-                ComponentName name
-        ) {
-
-            bound = false;
-            mcuMessenger = null;
-
-            steeringView.setText(
-                    "MCU disconnected"
-            );
-
-            updateStatus();
-        }
-    };
 
     @Override
     protected void onCreate(
             Bundle savedInstanceState
     ) {
 
-        super.onCreate(savedInstanceState);
+        super.onCreate(
+                savedInstanceState
+        );
 
         setContentView(
                 R.layout.activity_main
@@ -269,437 +195,642 @@ public class MainActivity extends Activity {
                         R.id.raw
                 );
 
-        sniffButton =
+        startButton =
                 findViewById(
                         R.id.sniff
                 );
 
-        baselineButton =
+        clearButton =
                 findViewById(
                         R.id.clear
                 );
 
-        steeringView.setText(
-                "Steering: waiting..."
+
+        startButton.setText(
+                "START AUTOCHIPS EVENT PROBE"
+        );
+
+        clearButton.setText(
+                "CLEAR EVENTS"
         );
 
         speedView.setText(
-                "Vehicle speed: not mapped yet"
+                "Vehicle speed: --"
+        );
+
+        steeringView.setText(
+                "Steering angle: --"
         );
 
         fuelView.setText(
-                "Fuel / tank / economy: not mapped yet"
+                "Fuel: not exposed by this Car Event service"
         );
 
-        rawView.setText(
-                "Start sniffer.\n"
-                        + "Wait 2 seconds.\n"
-                        + "Press SET BASELINE.\n"
-                        + "Then perform ONE test."
+
+        startButton.setOnClickListener(
+                v -> startProbe()
         );
 
-        baselineButton.setText(
-                "SET BASELINE"
+
+        clearButton.setOnClickListener(
+                v -> clearEvents()
         );
 
-        sniffButton.setOnClickListener(
-                v -> startSniffer()
-        );
 
-        baselineButton.setOnClickListener(
-                v -> setBaseline()
-        );
+        refreshConfiguration();
 
-        bindMcu();
+        showInitialInformation();
     }
 
-    private void bindMcu() {
 
-        Intent intent =
-                new Intent(
-                        "com.carocean.mcuservice"
-                );
+    /*
+     * -------------------------------------------------------------
+     * START LISTENING
+     * -------------------------------------------------------------
+     */
+    private void startProbe() {
 
-        intent.setPackage(
-                "com.carocean.mcuserver"
-        );
+        if (receiverRegistered) {
+
+            rawView.setText(
+                    "Probe is already active."
+            );
+
+            return;
+        }
+
+        refreshConfiguration();
+
+        IntentFilter filter =
+                new IntentFilter();
+
+        boolean haveAction =
+                false;
+
+
+        /*
+         * Listen to the actual firmware-configured action first.
+         */
+        if (
+                configuredAction != null
+                        && !configuredAction.trim().isEmpty()
+        ) {
+
+            filter.addAction(
+                    configuredAction.trim()
+            );
+
+            haveAction = true;
+        }
+
+
+        /*
+         * Also listen to the fallback action found in the factory APK.
+         */
+        if (
+                configuredAction == null
+                        || !FALLBACK_ACTION.equals(
+                        configuredAction.trim()
+                )
+        ) {
+
+            filter.addAction(
+                    FALLBACK_ACTION
+            );
+
+            haveAction = true;
+        }
+
+
+        if (!haveAction) {
+
+            rawView.setText(
+                    "No usable broadcast action found."
+            );
+
+            return;
+        }
+
 
         try {
 
-            boolean success =
-                    bindService(
-                            intent,
-                            connection,
-                            Context.BIND_AUTO_CREATE
-                    );
-
-            if (!success) {
-
-                steeringView.setText(
-                        "MCU bind failed"
-                );
-            }
-
-        } catch (Throwable t) {
-
-            steeringView.setText(
-                    "MCU bind error: "
-                            + t.getClass()
-                            .getSimpleName()
-            );
-        }
-    }
-
-    private void startSniffer() {
-
-        if (!bound || mcuMessenger == null) {
-
-            rawView.setText(
-                    "MCU is not connected."
+            registerReceiver(
+                    carEventReceiver,
+                    filter
             );
 
-            return;
-        }
+            receiverRegistered =
+                    true;
 
-        if (fullSniffer) {
-            return;
-        }
-
-        int[] commands = new int[256];
-
-        for (int i = 0; i < 256; i++) {
-            commands[i] = i;
-        }
-
-        if (register(commands, sniffReply)) {
-
-            fullSniffer = true;
-
-            sniffButton.setText(
-                    "MCU SNIFFER ACTIVE"
+            startButton.setText(
+                    "AUTOCHIPS PROBE ACTIVE"
             );
 
-            sniffButton.setEnabled(
+            startButton.setEnabled(
                     false
             );
 
-            rawView.setText(
-                    "Collecting MCU commands...\n\n"
-                            + "Wait about 2 seconds, then press SET BASELINE."
+            StringBuilder info =
+                    new StringBuilder();
+
+            info.append(
+                    "Listening for factory Car Event broadcasts.\n\n"
             );
 
-            updateStatus();
+            info.append(
+                    "Configured action:\n"
+            );
+
+            info.append(
+                    safe(configuredAction)
+            );
+
+            info.append(
+                    "\n\nConfigured package:\n"
+            );
+
+            info.append(
+                    safe(configuredPackage)
+            );
+
+            info.append(
+                    "\n\nOur package:\n"
+            );
+
+            info.append(
+                    getPackageName()
+            );
+
+            info.append(
+                    "\n\nFallback action:\n"
+            );
+
+            info.append(
+                    FALLBACK_ACTION
+            );
+
+            info.append(
+                    "\n\nNow drive slowly or turn the steering wheel."
+            );
+
+            rawView.setText(
+                    info.toString()
+            );
+
+            updateHeader();
+
+        } catch (Throwable t) {
+
+            rawView.setText(
+                    "Receiver registration failed:\n"
+                            + t.getClass()
+                            .getName()
+                            + "\n"
+                            + String.valueOf(
+                            t.getMessage()
+                    )
+            );
         }
     }
 
-    private boolean register(
-            int[] commands,
-            Messenger reply
+
+    /*
+     * -------------------------------------------------------------
+     * KNOWN FACTORY FIELDS
+     * -------------------------------------------------------------
+     */
+    private void processKnownField(
+            String key,
+            Object value
     ) {
 
-        if (mcuMessenger == null) {
-            return false;
+        if (key == null) {
+            return;
         }
+
+        String normalized =
+                key.toLowerCase(
+                        Locale.US
+                );
+
+        if (
+                normalized.equals(
+                        "speed_current_speed"
+                )
+                        || normalized.equals(
+                        "current_speed"
+                )
+        ) {
+
+            lastSpeed =
+                    valueText(value);
+
+            speedView.setText(
+                    "Vehicle speed: "
+                            + lastSpeed
+            );
+        }
+
+
+        if (
+                normalized.equals(
+                        "speed_accelerate_speed"
+                )
+                        || normalized.equals(
+                        "accelerate_speed"
+                )
+        ) {
+
+            lastAcceleration =
+                    valueText(value);
+        }
+
+
+        if (
+                normalized.equals(
+                        "steering_wheel_angle"
+                )
+                        || normalized.equals(
+                        "steering_wheel"
+                )
+        ) {
+
+            lastSteeringAngle =
+                    valueText(value);
+
+            steeringView.setText(
+                    "Steering angle: "
+                            + lastSteeringAngle
+            );
+        }
+
+
+        if (
+                normalized.equals(
+                        "steering_wheel_speed"
+                )
+        ) {
+
+            lastSteeringSpeed =
+                    valueText(value);
+        }
+    }
+
+
+    /*
+     * -------------------------------------------------------------
+     * SYSTEM PROPERTY DISCOVERY
+     * -------------------------------------------------------------
+     *
+     * android.os.SystemProperties is hidden from the public SDK,
+     * so use reflection. On this head unit it may still be readable.
+     */
+    private void refreshConfiguration() {
+
+        configuredAction =
+                readSystemProperty(
+                        PROP_ACTION,
+                        ""
+                );
+
+        configuredPackage =
+                readSystemProperty(
+                        PROP_PACKAGE,
+                        ""
+                );
+    }
+
+
+    private static String readSystemProperty(
+            String key,
+            String defaultValue
+    ) {
 
         try {
 
-            Message message =
-                    Message.obtain(
+            Class<?> clazz =
+                    Class.forName(
+                            "android.os.SystemProperties"
+                    );
+
+            Method get =
+                    clazz.getMethod(
+                            "get",
+                            String.class,
+                            String.class
+                    );
+
+            Object result =
+                    get.invoke(
                             null,
-                            256
+                            key,
+                            defaultValue
                     );
 
-            Bundle bundle = new Bundle();
-
-            bundle.putIntArray(
-                    "cmdcode",
-                    commands
-            );
-
-            message.setData(
-                    bundle
-            );
-
-            message.replyTo =
-                    reply;
-
-            mcuMessenger.send(
-                    message
-            );
-
-            return true;
-
-        } catch (
-                RemoteException
-                        | RuntimeException e
-        ) {
-
-            rawView.setText(
-                    "MCU registration failed: "
-                            + e.getMessage()
-            );
-
-            return false;
-        }
-    }
-
-    private void setBaseline() {
-
-        baselineNumber++;
-
-        for (CmdState state : states.values()) {
-
-            state.changedSinceBaseline =
-                    false;
-
-            state.baselinePayload =
-                    state.last == null
-                            ? null
-                            : Arrays.copyOf(
-                            state.last,
-                            state.last.length
-                    );
-
-            if (state.bytes != null) {
-
-                for (ByteState bs : state.bytes) {
-
-                    if (bs.current < 0) {
-                        continue;
-                    }
-
-                    bs.baseline =
-                            bs.current;
-
-                    bs.min =
-                            bs.current;
-
-                    bs.max =
-                            bs.current;
-
-                    bs.changes =
-                            0;
-
-                    bs.changedSinceBaseline =
-                            false;
-                }
+            if (result == null) {
+                return defaultValue;
             }
-        }
 
-        rawView.setText(
-                "BASELINE #"
-                        + baselineNumber
-                        + " SET\n\n"
-                        + "Now perform ONE test.\n\n"
-                        + "Example:\n"
-                        + "0 -> 10 -> 20 km/h -> stop"
-        );
-
-        updateStatus();
-    }
-
-    private void renderTable() {
-
-        if (baselineNumber == 0) {
-
-            rawView.setText(
-                    "Commands detected: "
-                            + states.size()
-                            + "\n\nPress SET BASELINE before testing."
+            return String.valueOf(
+                    result
             );
 
-            return;
+        } catch (Throwable ignored) {
+
+            return defaultValue;
         }
+    }
+
+
+    /*
+     * -------------------------------------------------------------
+     * DISPLAY
+     * -------------------------------------------------------------
+     */
+    private void showInitialInformation() {
+
+        String vendorHal;
+
+        try {
+
+            Class.forName(
+                    "vendor.autochips.hardware.car_event_monitor.V1_0.ICarEventMonitor"
+            );
+
+            vendorHal =
+                    "FOUND";
+
+        } catch (Throwable t) {
+
+            vendorHal =
+                    "not visible to this app";
+        }
+
 
         StringBuilder out =
                 new StringBuilder();
 
         out.append(
-                "CHANGED SINCE BASELINE #"
+                "AUTOCHIPS CAR EVENT PROBE\n\n"
         );
 
         out.append(
-                baselineNumber
+                "Vendor HAL class: "
+        );
+
+        out.append(
+                vendorHal
         );
 
         out.append(
                 "\n\n"
         );
 
-        int shownCommands = 0;
+        out.append(
+                PROP_ACTION
+        );
 
-        for (
-                Map.Entry<Integer, CmdState> entry :
-                states.entrySet()
+        out.append(
+                " =\n"
+        );
+
+        out.append(
+                safe(configuredAction)
+        );
+
+        out.append(
+                "\n\n"
+        );
+
+        out.append(
+                PROP_PACKAGE
+        );
+
+        out.append(
+                " =\n"
+        );
+
+        out.append(
+                safe(configuredPackage)
+        );
+
+        out.append(
+                "\n\nOur package =\n"
+        );
+
+        out.append(
+                getPackageName()
+        );
+
+        out.append(
+                "\n\nPress START AUTOCHIPS EVENT PROBE."
+        );
+
+        rawView.setText(
+                out.toString()
+        );
+
+        updateHeader();
+    }
+
+
+    private void updateHeader() {
+
+        statusView.setText(
+                "Autochips probe: "
+                        + (
+                        receiverRegistered
+                                ? "ACTIVE"
+                                : "not started"
+                )
+                        + "\nEvents received: "
+                        + eventCount
+                        + "\nAction: "
+                        + shortText(
+                        configuredAction
+                )
+                        + "\nTarget package: "
+                        + shortText(
+                        configuredPackage
+                )
+        );
+
+
+        if (
+                !"--".equals(
+                        lastAcceleration
+                )
         ) {
 
-            int cmd =
-                    entry.getKey();
-
-            CmdState state =
-                    entry.getValue();
-
-            if (!state.changedSinceBaseline
-                    || state.last == null) {
-
-                continue;
-            }
-
-            shownCommands++;
-
-            out.append(
-                    String.format(
-                            Locale.US,
-                            "CMD 0x%02X   RX:%d   PKT-CHG:%d\n",
-                            cmd & 0xFF,
-                            state.rx,
-                            state.packetChanges
-                    )
-            );
-
-            out.append(
-                    "LATEST: "
-            );
-
-            out.append(
-                    hex(state.last)
-            );
-
-            out.append(
-                    "\n"
-            );
-
-            out.append(
-                    "BYTE  BASE MIN  MAX  NOW  CHG\n"
-            );
-
-            if (state.bytes != null) {
-
-                for (
-                        int i = 0;
-                        i < state.bytes.length;
-                        i++
-                ) {
-
-                    ByteState bs =
-                            state.bytes[i];
-
-                    if (!bs.changedSinceBaseline) {
-                        continue;
-                    }
-
-                    out.append(
-                            String.format(
-                                    Locale.US,
-                                    "B%-3d  %02X   %02X   %02X   %02X   %d\n",
-                                    i,
-                                    bs.baseline & 0xFF,
-                                    bs.min & 0xFF,
-                                    bs.max & 0xFF,
-                                    bs.current & 0xFF,
-                                    bs.changes
-                            )
-                    );
-                }
-            }
-
-            out.append(
-                    "\n"
+            speedView.setText(
+                    "Speed: "
+                            + lastSpeed
+                            + "   Accel: "
+                            + lastAcceleration
             );
         }
 
-        if (shownCommands == 0) {
 
-            out.append(
-                    "(no changes detected yet)"
+        if (
+                !"--".equals(
+                        lastSteeringSpeed
+                )
+        ) {
+
+            steeringView.setText(
+                    "Steering angle: "
+                            + lastSteeringAngle
+                            + "   Speed: "
+                            + lastSteeringSpeed
             );
         }
+    }
+
+
+    private void addEvent(
+            String event
+    ) {
+
+        recentEvents.add(
+                0,
+                event
+        );
+
+        while (
+                recentEvents.size() > 20
+        ) {
+
+            recentEvents.remove(
+                    recentEvents.size() - 1
+            );
+        }
+
+
+        StringBuilder out =
+                new StringBuilder();
+
+        out.append(
+                "LIVE CAR EVENTS\n\n"
+        );
+
+        for (String item : recentEvents) {
+
+            out.append(
+                    item
+            );
+
+            out.append(
+                    "\n--------------------\n"
+            );
+        }
+
 
         rawView.setText(
                 out.toString()
         );
     }
 
-    private void updateStatus() {
 
-        statusView.setText(
-                "MCU: "
+    private void clearEvents() {
+
+        recentEvents.clear();
+
+        eventCount = 0;
+
+        lastSpeed = "--";
+        lastAcceleration = "--";
+        lastSteeringAngle = "--";
+        lastSteeringSpeed = "--";
+
+        speedView.setText(
+                "Vehicle speed: --"
+        );
+
+        steeringView.setText(
+                "Steering angle: --"
+        );
+
+        rawView.setText(
+                "Events cleared.\n\n"
                         + (
-                        bound
-                                ? "connected"
-                                : "disconnected"
+                        receiverRegistered
+                                ? "Probe is still active."
+                                : "Press START AUTOCHIPS EVENT PROBE."
                 )
-                        + "\nPackets received: "
-                        + totalPackets
-                        + "   Unique commands: "
-                        + states.size()
-                        + "\nSniffer: "
-                        + (
-                        fullSniffer
-                                ? "ACTIVE"
-                                : "not started"
-                )
-                        + "   Baseline: #"
-                        + baselineNumber
+        );
+
+        updateHeader();
+    }
+
+
+    private static String valueText(
+            Object value
+    ) {
+
+        if (value == null) {
+            return "<null>";
+        }
+
+        return String.valueOf(
+                value
         );
     }
 
-    private static String hex(
-            byte[] data
+
+    private static String safe(
+            String text
     ) {
 
-        StringBuilder output =
-                new StringBuilder();
+        if (
+                text == null
+                        || text.trim().isEmpty()
+        ) {
 
-        for (byte b : data) {
-
-            output.append(
-                    String.format(
-                            Locale.US,
-                            "%02X ",
-                            b & 0xFF
-                    )
-            );
+            return "<empty / unreadable>";
         }
 
-        return output
-                .toString()
-                .trim();
+        return text;
     }
 
-    private static String direction(
-            int track
+
+    private static String shortText(
+            String text
     ) {
 
-        if (track == 0) {
-            return "STRAIGHT";
+        if (
+                text == null
+                        || text.trim().isEmpty()
+        ) {
+
+            return "<empty>";
         }
 
-        if (track >= 1 && track <= 36) {
-            return "RIGHT";
+        if (
+                text.length() <= 42
+        ) {
+
+            return text;
         }
 
-        if (track >= 129 && track <= 164) {
-            return "LEFT";
-        }
-
-        return "UNKNOWN";
+        return text.substring(
+                0,
+                39
+        ) + "...";
     }
+
 
     @Override
     protected void onDestroy() {
 
-        if (bound) {
+        if (receiverRegistered) {
 
             try {
 
-                unbindService(
-                        connection
+                unregisterReceiver(
+                        carEventReceiver
                 );
 
-            } catch (
-                    Exception ignored
-            ) {
+            } catch (Exception ignored) {
             }
         }
 
