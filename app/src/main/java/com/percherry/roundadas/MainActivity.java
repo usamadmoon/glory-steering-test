@@ -1,11 +1,9 @@
 package com.percherry.roundadas;
 
 import android.app.Activity;
-import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.os.Bundle;
 import android.os.Handler;
@@ -16,934 +14,219 @@ import android.os.RemoteException;
 import android.widget.Button;
 import android.widget.TextView;
 
-import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.Locale;
-import java.util.Set;
+import java.util.Map;
+import java.util.TreeMap;
 
 public class MainActivity extends Activity {
 
-    /*
-     * Broadcast used by the factory / Autochips car-event layer.
-     *
-     * One of the head-unit APKs we inspected uses this vehicle-data path.
-     */
-    private static final String CAR_EVENT_ACTION =
-            "com.percherry.roundadas.LOOK_AROUND_360_CAN";
-
-    private TextView steeringView;
-    private TextView speedView;
-    private TextView fuelView;
-    private TextView statusView;
-    private TextView rawView;
-
-    private Button sniffButton;
-    private Button clearButton;
+    private TextView steeringView, speedView, fuelView, statusView, rawView;
+    private Button sniffButton, clearButton;
 
     private Messenger mcuMessenger;
-    private boolean mcuBound = false;
-
-    private boolean fullSnifferRegistered = false;
-    private boolean receiverRegistered = false;
-
-    private int mcuPacketCount = 0;
-    private int carEventCount = 0;
-
-    private int lastTrackValue = -1;
-    private Double lastSpeed = null;
-
-    /*
-     * Keep only the newest messages so the screen does not grow forever.
-     */
-    private final ArrayDeque<String> recentLog = new ArrayDeque<>();
-
-
-    /*
-     * ------------------------------------------------------------------
-     * AUTOCHIPS / VEHICLE EVENT RECEIVER
-     * ------------------------------------------------------------------
-     */
-    private final BroadcastReceiver carEventReceiver =
-            new BroadcastReceiver() {
-
-                @Override
-                public void onReceive(Context context, Intent intent) {
-
-                    if (intent == null) {
-                        return;
-                    }
-
-                    carEventCount++;
-
-                    Bundle extras = intent.getExtras();
-
-                    if (extras == null) {
-
-                        addLog(
-                                "CAR EVENT: no extras"
-                        );
-
-                        updateStatus();
-                        return;
-                    }
-
-                    StringBuilder line =
-                            new StringBuilder("CAR EVENT: ");
-
-                    Set<String> keys = extras.keySet();
-
-                    for (String key : keys) {
-
-                        Object value;
-
-                        try {
-                            value = extras.get(key);
-                        } catch (Throwable t) {
-                            value = "<unreadable>";
-                        }
-
-                        line.append(key)
-                                .append("=")
-                                .append(String.valueOf(value))
-                                .append("  ");
-
-                        handleVehicleField(
-                                key,
-                                value
-                        );
-                    }
-
-                    addLog(
-                            line.toString()
-                    );
-
-                    updateStatus();
-                }
-            };
-
-
-    /*
-     * ------------------------------------------------------------------
-     * MCU CALLBACK HANDLER
-     * ------------------------------------------------------------------
-     *
-     * Factory McuServer sends registered MCU packets here.
-     */
-    private final Handler incomingHandler =
-            new Handler(msg -> {
-
-                Bundle data = msg.getData();
-
-                int command = -1;
-                byte[] payload = null;
-
-                if (data != null) {
-
-                    command =
-                            data.getInt(
-                                    "cmdcode",
-                                    -1
-                            );
-
-                    payload =
-                            data.getByteArray(
-                                    "data"
-                            );
-                }
-
-                if (payload != null) {
-
-                    mcuPacketCount++;
-
-                    String hex =
-                            bytesToHex(payload);
-
-                    addLog(
-                            "MCU "
-                                    + command
-                                    + " / 0x"
-                                    + String.format(
-                                    Locale.US,
-                                    "%02X",
-                                    command & 0xFF
-                            )
-                                    + " len="
-                                    + payload.length
-                                    + " : "
-                                    + hex
-                    );
-
-
-                    /*
-                     * Existing steering discovery.
-                     *
-                     * Factory CKXBackCar2 uses:
-                     *
-                     * command = 235 / 0xEB
-                     * byte[2] = steering track value
-                     */
-                    if (
-                            command == 235
-                                    && payload.length > 2
-                    ) {
-
-                        int track =
-                                payload[2] & 0xFF;
-
-                        lastTrackValue =
-                                track;
-
-                        steeringView.setText(
-                                "Steering track: "
-                                        + track
-                                        + "  "
-                                        + getTrackDirection(track)
-                        );
-                    }
-
-                } else {
-
-                    addLog(
-                            "MCU message"
-                                    + " what="
-                                    + msg.what
-                                    + " cmd="
-                                    + command
-                                    + " no payload"
-                    );
-                }
-
-                updateStatus();
-
-                return true;
-            });
-
-
-    private final Messenger clientMessenger =
-            new Messenger(
-                    incomingHandler
-            );
-
-
-    /*
-     * ------------------------------------------------------------------
-     * MCU SERVICE CONNECTION
-     * ------------------------------------------------------------------
-     */
-    private final ServiceConnection mcuConnection =
-            new ServiceConnection() {
-
-                @Override
-                public void onServiceConnected(
-                        ComponentName name,
-                        IBinder service
-                ) {
-
-                    mcuBound = true;
-
-                    mcuMessenger =
-                            new Messenger(service);
-
-                    steeringView.setText(
-                            "MCU connected"
-                    );
-
-                    addLog(
-                            "Connected to com.carocean.mcuserver"
-                    );
-
-
-                    /*
-                     * Register the steering command immediately.
-                     */
-                    registerMcuCallbacks(
-                            new int[]{235},
-                            "steering 235 / 0xEB"
-                    );
-
-                    updateStatus();
-                }
-
-
-                @Override
-                public void onServiceDisconnected(
-                        ComponentName name
-                ) {
-
-                    mcuBound = false;
-
-                    mcuMessenger = null;
-
-                    steeringView.setText(
-                            "MCU disconnected"
-                    );
-
-                    addLog(
-                            "MCU service disconnected"
-                    );
-
-                    updateStatus();
-                }
-            };
-
-
-    /*
-     * ------------------------------------------------------------------
-     * ACTIVITY
-     * ------------------------------------------------------------------
-     */
-    @Override
-    protected void onCreate(
-            Bundle savedInstanceState
-    ) {
-
-        super.onCreate(
-                savedInstanceState
-        );
-
-        setContentView(
-                R.layout.activity_main
-        );
-
-
-        steeringView =
-                findViewById(
-                        R.id.steering
-                );
-
-        speedView =
-                findViewById(
-                        R.id.speed
-                );
-
-        fuelView =
-                findViewById(
-                        R.id.fuel
-                );
-
-        statusView =
-                findViewById(
-                        R.id.status
-                );
-
-        rawView =
-                findViewById(
-                        R.id.raw
-                );
-
-        sniffButton =
-                findViewById(
-                        R.id.sniff
-                );
-
-        clearButton =
-                findViewById(
-                        R.id.clear
-                );
-
-
-        steeringView.setText(
-                "Steering: waiting..."
-        );
-
-        speedView.setText(
-                "Vehicle speed: --"
-        );
-
-        fuelView.setText(
-                "Fuel / tank / economy: not mapped"
-        );
-
-
-        sniffButton.setOnClickListener(
-                v -> startFullMcuSniffer()
-        );
-
-
-        clearButton.setOnClickListener(
-                v -> {
-
-                    recentLog.clear();
-
-                    mcuPacketCount = 0;
-                    carEventCount = 0;
-
-                    rawView.setText(
-                            "Log cleared"
-                    );
-
-                    updateStatus();
-                }
-        );
-
-
-        /*
-         * Listen for factory vehicle events.
-         */
-        try {
-
-            IntentFilter filter =
-                    new IntentFilter(
-                            CAR_EVENT_ACTION
-                    );
-
-            registerReceiver(
-                    carEventReceiver,
-                    filter
-            );
-
-            receiverRegistered = true;
-
-            addLog(
-                    "Car-event listener registered"
-            );
-
-        } catch (Throwable t) {
-
-            addLog(
-                    "Car-event receiver error: "
-                            + t.getClass()
-                            .getSimpleName()
-            );
+    private boolean bound = false;
+    private boolean fullSniffer = false;
+    private long totalPackets = 0;
+    private long baselineNumber = 0;
+
+    private static class CmdState {
+        long rx;
+        long changes;
+        byte[] last;
+        byte[] baseline;
+        boolean changedSinceBaseline;
+    }
+
+    private final Map<Integer, CmdState> states = new TreeMap<>();
+
+    /* Dedicated steering listener. This stays separate from the full sniffer. */
+    private final Handler steeringHandler = new Handler(msg -> {
+        Bundle b = msg.getData();
+        if (b == null) return true;
+        int cmd = b.getInt("cmdcode", -1);
+        byte[] data = b.getByteArray("data");
+        if (cmd == 235 && data != null && data.length > 2) {
+            int track = data[2] & 0xFF;
+            steeringView.setText("Steering 0xEB: " + track + "  " + direction(track));
+        }
+        return true;
+    });
+    private final Messenger steeringReply = new Messenger(steeringHandler);
+
+    /* Full sniffer: stores one state per command instead of repeating rows. */
+    private final Handler sniffHandler = new Handler(msg -> {
+        Bundle b = msg.getData();
+        if (b == null) return true;
+        int cmd = b.getInt("cmdcode", -1);
+        byte[] data = b.getByteArray("data");
+        if (cmd < 0 || data == null) return true;
+
+        totalPackets++;
+        CmdState s = states.get(cmd);
+        if (s == null) {
+            s = new CmdState();
+            states.put(cmd, s);
+        }
+        s.rx++;
+
+        boolean changed = s.last == null || !Arrays.equals(s.last, data);
+        if (changed) {
+            s.changes++;
+            s.last = Arrays.copyOf(data, data.length);
+            if (s.baseline == null || !Arrays.equals(s.baseline, data)) {
+                s.changedSinceBaseline = true;
+            }
+            renderTable();
         }
 
-
-        bindToMcuService();
+        if (cmd == 235 && data.length > 2) {
+            int track = data[2] & 0xFF;
+            steeringView.setText("Steering 0xEB: " + track + "  " + direction(track));
+        }
 
         updateStatus();
+        return true;
+    });
+    private final Messenger sniffReply = new Messenger(sniffHandler);
+
+    private final ServiceConnection connection = new ServiceConnection() {
+        @Override public void onServiceConnected(ComponentName name, IBinder service) {
+            bound = true;
+            mcuMessenger = new Messenger(service);
+            steeringView.setText("MCU connected - waiting for 0xEB steering");
+            register(new int[]{235}, steeringReply);
+            updateStatus();
+        }
+        @Override public void onServiceDisconnected(ComponentName name) {
+            bound = false;
+            mcuMessenger = null;
+            steeringView.setText("MCU disconnected");
+            updateStatus();
+        }
+    };
+
+    @Override protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        steeringView = findViewById(R.id.steering);
+        speedView = findViewById(R.id.speed);
+        fuelView = findViewById(R.id.fuel);
+        statusView = findViewById(R.id.status);
+        rawView = findViewById(R.id.raw);
+        sniffButton = findViewById(R.id.sniff);
+        clearButton = findViewById(R.id.clear);
+
+        speedView.setText("Vehicle speed: not mapped yet");
+        fuelView.setText("Fuel / tank / economy: not mapped yet");
+        rawView.setText("Start sniffer, wait 2 seconds, then SET BASELINE.\nOnly new/changed command states will remain visible.");
+        clearButton.setText("SET BASELINE");
+
+        sniffButton.setOnClickListener(v -> startSniffer());
+        clearButton.setOnClickListener(v -> setBaseline());
+        bindMcu();
     }
 
-
-    /*
-     * ------------------------------------------------------------------
-     * VEHICLE FIELD PARSING
-     * ------------------------------------------------------------------
-     */
-    private void handleVehicleField(
-            String key,
-            Object value
-    ) {
-
-        if (key == null) {
-            return;
-        }
-
-        String k =
-                key.toLowerCase(
-                        Locale.US
-                );
-
-
-        /*
-         * SPEED
-         *
-         * We saw current_speed in the factory Autochips interface.
-         */
-        if (
-                k.equals("speed_current_speed")
-                        || k.equals("current_speed")
-                        || k.equals("vehicle_speed")
-                        || k.equals("speed")
-        ) {
-
-            if (value instanceof Number) {
-
-                lastSpeed =
-                        ((Number) value)
-                                .doubleValue();
-
-                speedView.setText(
-                        "Vehicle speed: "
-                                + formatNumber(
-                                lastSpeed
-                        )
-                );
-            }
-        }
-
-
-        /*
-         * STEERING
-         *
-         * Keep this generic because different firmware versions
-         * may use slightly different key names.
-         */
-        if (
-                k.contains("steering")
-                        && value instanceof Number
-        ) {
-
-            steeringView.setText(
-                    "Steering event: "
-                            + key
-                            + " = "
-                            + value
-            );
-        }
-
-
-        /*
-         * IMPORTANT:
-         *
-         * We do not yet know the exact fuel key on this firmware.
-         *
-         * If ANY undocumented field contains likely fuel-related
-         * wording, show it immediately.
-         */
-        if (
-                k.contains("fuel")
-                        || k.contains("tank")
-                        || k.contains("consum")
-                        || k.contains("econom")
-                        || k.contains("mileage")
-                        || k.contains("range")
-                        || k.contains("remaining")
-        ) {
-
-            fuelView.setText(
-                    "Fuel candidate: "
-                            + key
-                            + " = "
-                            + String.valueOf(value)
-            );
-        }
-    }
-
-
-    /*
-     * ------------------------------------------------------------------
-     * MCU BINDING
-     * ------------------------------------------------------------------
-     */
-    private void bindToMcuService() {
-
-        Intent intent =
-                new Intent(
-                        "com.carocean.mcuservice"
-                );
-
-        intent.setPackage(
-                "com.carocean.mcuserver"
-        );
-
+    private void bindMcu() {
+        Intent i = new Intent("com.carocean.mcuservice");
+        i.setPackage("com.carocean.mcuserver");
         try {
-
-            boolean success =
-                    bindService(
-                            intent,
-                            mcuConnection,
-                            Context.BIND_AUTO_CREATE
-                    );
-
-            if (!success) {
-
-                steeringView.setText(
-                        "MCU bind failed"
-                );
-
-                addLog(
-                        "bindService returned false"
-                );
+            if (!bindService(i, connection, Context.BIND_AUTO_CREATE)) {
+                steeringView.setText("MCU bind failed");
             }
-
         } catch (Throwable t) {
-
-            steeringView.setText(
-                    "MCU bind error"
-            );
-
-            addLog(
-                    "MCU bind exception: "
-                            + t.getClass()
-                            .getSimpleName()
-                            + " "
-                            + t.getMessage()
-            );
+            steeringView.setText("MCU bind error: " + t.getClass().getSimpleName());
         }
     }
 
-
-    /*
-     * ------------------------------------------------------------------
-     * READ-ONLY MCU SNIFFER
-     * ------------------------------------------------------------------
-     *
-     * This registers callbacks.
-     *
-     * It DOES NOT transmit commands to the car.
-     */
-    private void startFullMcuSniffer() {
-
-        if (
-                !mcuBound
-                        || mcuMessenger == null
-        ) {
-
-            addLog(
-                    "Cannot start sniffer: MCU not connected"
-            );
-
+    private void startSniffer() {
+        if (!bound || mcuMessenger == null) {
+            rawView.setText("MCU is not connected.");
             return;
         }
+        if (fullSniffer) return;
 
-
-        if (fullSnifferRegistered) {
-
-            addLog(
-                    "MCU sniffer already active"
-            );
-
-            return;
+        int[] cmds = new int[256];
+        for (int i = 0; i < 256; i++) cmds[i] = i;
+        if (register(cmds, sniffReply)) {
+            fullSniffer = true;
+            sniffButton.setText("MCU SNIFFER ACTIVE");
+            sniffButton.setEnabled(false);
+            rawView.setText("Collecting unique commands...\nWait ~2 seconds, then press SET BASELINE.");
+            updateStatus();
         }
-
-
-        /*
-         * MCU command IDs appear to be one byte.
-         *
-         * Register callback listeners for all 0..255.
-         */
-        int[] commands =
-                new int[256];
-
-        for (
-                int i = 0;
-                i < commands.length;
-                i++
-        ) {
-
-            commands[i] = i;
-        }
-
-
-        boolean success =
-                registerMcuCallbacks(
-                        commands,
-                        "all MCU commands 0..255"
-                );
-
-
-        if (success) {
-
-            fullSnifferRegistered = true;
-
-            sniffButton.setText(
-                    "MCU SNIFFER ACTIVE"
-            );
-
-            sniffButton.setEnabled(
-                    false
-            );
-
-            addLog(
-                    "FULL MCU SNIFFER ACTIVE"
-            );
-
-            addLog(
-                    "Watch which packets change with speed / fuel / ignition"
-            );
-        }
-
-
-        updateStatus();
     }
 
-
-    /*
-     * Factory McuService protocol:
-     *
-     * Message.what = 256
-     *
-     * Bundle:
-     *     int[] \"cmdcode\"
-     *
-     * replyTo:
-     *     callback Messenger
-     */
-    private boolean registerMcuCallbacks(
-            int[] commands,
-            String description
-    ) {
-
-        if (mcuMessenger == null) {
-
-            return false;
-        }
-
-
+    private boolean register(int[] cmds, Messenger reply) {
         try {
-
-            Message msg =
-                    Message.obtain(
-                            null,
-                            256
-                    );
-
-
-            Bundle bundle =
-                    new Bundle();
-
-
-            bundle.putIntArray(
-                    "cmdcode",
-                    commands
-            );
-
-
-            msg.setData(
-                    bundle
-            );
-
-
-            msg.replyTo =
-                    clientMessenger;
-
-
-            mcuMessenger.send(
-                    msg
-            );
-
-
-            addLog(
-                    "Registered callback: "
-                            + description
-            );
-
+            Message m = Message.obtain(null, 256);
+            Bundle b = new Bundle();
+            b.putIntArray("cmdcode", cmds);
+            m.setData(b);
+            m.replyTo = reply;
+            mcuMessenger.send(m);
             return true;
-
-
-        } catch (RemoteException e) {
-
-            addLog(
-                    "MCU registration failed: "
-                            + e.getMessage()
-            );
-
-            return false;
-
-
-        } catch (Throwable t) {
-
-            addLog(
-                    "MCU registration error: "
-                            + t.getClass()
-                            .getSimpleName()
-                            + " "
-                            + t.getMessage()
-            );
-
+        } catch (RemoteException | RuntimeException e) {
+            rawView.setText("MCU registration failed: " + e.getMessage());
             return false;
         }
     }
 
+    private void setBaseline() {
+        baselineNumber++;
+        for (CmdState s : states.values()) {
+            s.baseline = s.last == null ? null : Arrays.copyOf(s.last, s.last.length);
+            s.changedSinceBaseline = false;
+        }
+        rawView.setText("BASELINE #" + baselineNumber + " SET\nNow perform ONE action (for example P -> D).\nOnly commands that change after this baseline will appear.");
+        updateStatus();
+    }
 
-    /*
-     * ------------------------------------------------------------------
-     * DISPLAY HELPERS
-     * ------------------------------------------------------------------
-     */
+    private void renderTable() {
+        StringBuilder out = new StringBuilder();
+        out.append("CHANGED SINCE BASELINE #").append(baselineNumber).append("\n");
+        out.append("CMD    RX     CHG    LATEST\n");
+
+        int shown = 0;
+        for (Map.Entry<Integer, CmdState> e : states.entrySet()) {
+            CmdState s = e.getValue();
+            if (baselineNumber > 0 && !s.changedSinceBaseline) continue;
+            if (s.last == null) continue;
+            out.append(String.format(Locale.US, "0x%02X  %-6d %-6d %s\n",
+                    e.getKey() & 0xFF, s.rx, s.changes, hex(s.last)));
+            shown++;
+        }
+        if (shown == 0) out.append("(no changes yet)\n");
+        rawView.setText(out.toString());
+    }
+
     private void updateStatus() {
-
-        if (statusView == null) {
-            return;
-        }
-
-
-        String text =
-                "MCU: "
-                        + (
-                        mcuBound
-                                ? "connected"
-                                : "disconnected"
-                )
-                        + "\nPackets: "
-                        + mcuPacketCount
-                        + "   Car events: "
-                        + carEventCount
-                        + "\nSniffer: "
-                        + (
-                        fullSnifferRegistered
-                                ? "0..255 ACTIVE"
-                                : "235 / 0xEB only"
-                );
-
-
-        if (lastTrackValue >= 0) {
-
-            text +=
-                    "\nTrack: "
-                            + lastTrackValue;
-        }
-
-
-        if (lastSpeed != null) {
-
-            text +=
-                    "   Speed: "
-                            + formatNumber(
-                            lastSpeed
-                    );
-        }
-
-
         statusView.setText(
-                text
-        );
+                "MCU: " + (bound ? "connected" : "disconnected") +
+                "\nPackets received: " + totalPackets +
+                "   Unique commands: " + states.size() +
+                "\nSniffer: " + (fullSniffer ? "ACTIVE" : "not started") +
+                "   Baseline: #" + baselineNumber);
     }
 
-
-    private void addLog(
-            String line
-    ) {
-
-        recentLog.addFirst(
-                line
-        );
-
-
-        while (
-                recentLog.size() > 100
-        ) {
-
-            recentLog.removeLast();
-        }
-
-
-        StringBuilder out =
-                new StringBuilder();
-
-
-        for (String item : recentLog) {
-
-            out.append(item)
-                    .append("\n");
-        }
-
-
-        if (rawView != null) {
-
-            rawView.setText(
-                    out.toString()
-            );
-        }
+    private static String hex(byte[] d) {
+        StringBuilder s = new StringBuilder();
+        for (byte b : d) s.append(String.format(Locale.US, "%02X ", b & 0xFF));
+        return s.toString().trim();
     }
 
-
-    private static String bytesToHex(
-            byte[] payload
-    ) {
-
-        StringBuilder out =
-                new StringBuilder();
-
-
-        for (byte b : payload) {
-
-            out.append(
-                    String.format(
-                            Locale.US,
-                            "%02X ",
-                            b & 0xFF
-                    )
-            );
-        }
-
-
-        return out
-                .toString()
-                .trim();
-    }
-
-
-    private static String getTrackDirection(
-            int track
-    ) {
-
-        if (track == 0) {
-
-            return "STRAIGHT";
-        }
-
-
-        if (
-                track >= 1
-                        && track <= 36
-        ) {
-
-            return "RIGHT";
-        }
-
-
-        if (
-                track >= 129
-                        && track <= 164
-        ) {
-
-            return "LEFT";
-        }
-
-
+    private static String direction(int track) {
+        if (track == 0) return "STRAIGHT";
+        if (track >= 1 && track <= 36) return "RIGHT";
+        if (track >= 129 && track <= 164) return "LEFT";
         return "UNKNOWN";
     }
 
-
-    private static String formatNumber(
-            double value
-    ) {
-
-        if (
-                Math.rint(value)
-                        == value
-        ) {
-
-            return String.format(
-                    Locale.US,
-                    "%.0f",
-                    value
-            );
+    @Override protected void onDestroy() {
+        if (bound) {
+            try { unbindService(connection); } catch (Exception ignored) {}
         }
-
-
-        return String.format(
-                Locale.US,
-                "%.2f",
-                value
-        );
-    }
-
-
-    /*
-     * ------------------------------------------------------------------
-     * CLEANUP
-     * ------------------------------------------------------------------
-     */
-    @Override
-    protected void onDestroy() {
-
-        if (receiverRegistered) {
-
-            try {
-
-                unregisterReceiver(
-                        carEventReceiver
-                );
-
-            } catch (Exception ignored) {
-            }
-        }
-
-
-        if (mcuBound) {
-
-            try {
-
-                unbindService(
-                        mcuConnection
-                );
-
-            } catch (Exception ignored) {
-            }
-        }
-
-
         super.onDestroy();
     }
 }
